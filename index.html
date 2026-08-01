@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Accessible Album Builder</title>
+<style>
+  :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { margin:0; padding:1rem; max-width:760px; margin-inline:auto; line-height:1.45; }
+  h1 { font-size:1.8rem; margin:.25rem 0 .4rem; }
+  h2 { font-size:1.35rem; margin:1.5rem 0 .6rem; }
+  p { margin:.35rem 0 .8rem; }
+  button, input, select { font:inherit; min-height:44px; }
+  button { padding:.7rem 1rem; border-radius:.8rem; border:1px solid currentColor; margin:.25rem .25rem .25rem 0; }
+  input[type="number"] { width:7rem; padding:.55rem; border-radius:.6rem; border:1px solid #888; }
+  input[type="file"] { width:100%; padding:.7rem 0; }
+  .card { border:1px solid #8888; border-radius:1rem; padding:1rem; margin:.8rem 0; }
+  .row { display:flex; flex-wrap:wrap; gap:.4rem; align-items:center; }
+  .grow { flex:1 1 12rem; }
+  .muted { opacity:.78; }
+  .status { padding:.8rem; border-radius:.7rem; background:#7772; margin:.8rem 0; }
+  .danger { background:#b0002030; }
+  .success { background:#0a7a2b25; }
+  .song-title { font-weight:700; font-size:1.1rem; overflow-wrap:anywhere; }
+  .small { font-size:.93rem; }
+  .hidden { display:none !important; }
+  progress { width:100%; height:1.2rem; }
+  audio { width:100%; margin-top:.6rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Accessible Album Builder</h1>
+  <p>Add your WAV songs, trim silence, arrange them, and make one WAV album. Everything stays on your device.</p>
+
+  <div class="card">
+    <label for="files"><strong>Add WAV songs</strong></label>
+    <input id="files" type="file" accept=".wav,audio/wav,audio/x-wav" multiple>
+    <p class="small muted">You can choose all songs at once. Their order can be changed afterwards.</p>
+  </div>
+
+  <section aria-labelledby="songsHeading">
+    <h2 id="songsHeading">Songs</h2>
+    <div id="songs"></div>
+  </section>
+
+  <section class="card" aria-labelledby="albumHeading">
+    <h2 id="albumHeading">Album settings</h2>
+    <div class="row">
+      <label for="gap">Gap between songs, seconds</label>
+      <input id="gap" type="number" min="0" max="30" step="0.1" value="1">
+    </div>
+    <p class="small muted">Use 0 for no gap, or around 1 second for a natural pause.</p>
+    <button id="build" type="button">Build album</button>
+    <button id="clear" type="button">Clear all songs</button>
+  </section>
+
+  <div id="status" class="status" role="status" aria-live="polite">No songs added yet.</div>
+  <progress id="progress" class="hidden" value="0" max="1" aria-label="Progress"></progress>
+
+  <section id="result" class="card hidden" aria-labelledby="resultHeading">
+    <h2 id="resultHeading">Finished album</h2>
+    <audio id="player" controls></audio>
+    <p><a id="download" download="school-journey-album.wav">Save finished WAV</a></p>
+    <p class="small muted">On iPhone, open the link, then use Share and Save to Files.</p>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const songsEl = $("songs");
+const statusEl = $("status");
+const progressEl = $("progress");
+const resultEl = $("result");
+const playerEl = $("player");
+const downloadEl = $("download");
+let songs = [];
+let outputUrl = null;
+
+function announce(message, kind="") {
+  statusEl.textContent = message;
+  statusEl.className = "status" + (kind ? " " + kind : "");
+}
+
+function formatTime(seconds) {
+  if (!Number.isFinite(seconds)) return "unknown";
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+function readAscii(view, offset, len) {
+  let s = "";
+  for (let i = 0; i < len; i++) s += String.fromCharCode(view.getUint8(offset+i));
+  return s;
+}
+
+async function parseWav(file) {
+  const head = await file.slice(0, Math.min(file.size, 1024 * 1024)).arrayBuffer();
+  const view = new DataView(head);
+  if (readAscii(view,0,4) !== "RIFF" || readAscii(view,8,4) !== "WAVE") {
+    throw new Error("This file is not a standard WAV file.");
+  }
+  let pos = 12, fmt = null, data = null;
+  while (pos + 8 <= view.byteLength) {
+    const id = readAscii(view,pos,4);
+    const size = view.getUint32(pos+4,true);
+    const body = pos + 8;
+    if (id === "fmt ") {
+      fmt = {
+        audioFormat: view.getUint16(body,true),
+        channels: view.getUint16(body+2,true),
+        sampleRate: view.getUint32(body+4,true),
+        byteRate: view.getUint32(body+8,true),
+        blockAlign: view.getUint16(body+12,true),
+        bitsPerSample: view.getUint16(body+14,true)
+      };
+    } else if (id === "data") {
+      data = { offset: body, size };
+      break;
+    }
+    pos = body + size + (size % 2);
+  }
+  if (!fmt || !data) throw new Error("Could not find the WAV audio data.");
+  const duration = data.size / fmt.byteRate;
+  return { ...fmt, dataOffset:data.offset, dataSize:data.size, duration };
+}
+
+function sameFormat(a,b) {
+  return a.audioFormat===b.audioFormat &&
+    a.channels===b.channels &&
+    a.sampleRate===b.sampleRate &&
+    a.bitsPerSample===b.bitsPerSample &&
+    a.blockAlign===b.blockAlign;
+}
+
+function render() {
+  songsEl.innerHTML = "";
+  songs.forEach((song, index) => {
+    const card = document.createElement("article");
+    card.className = "card";
+    card.innerHTML = `
+      <div class="song-title">${index+1}. ${escapeHtml(song.file.name)}</div>
+      <p class="small muted">Length: ${formatTime(song.meta.duration)}. ${song.meta.channels} channel${song.meta.channels===1?"":"s"}, ${song.meta.sampleRate} Hz, ${song.meta.bitsPerSample}-bit.</p>
+      <div class="row">
+        <label>Trim start, seconds
+          <input data-action="trimStart" data-index="${index}" type="number" min="0" max="${song.meta.duration}" step="0.1" value="${song.trimStart.toFixed(1)}">
+        </label>
+        <label>Trim end, seconds
+          <input data-action="trimEnd" data-index="${index}" type="number" min="0" max="${song.meta.duration}" step="0.1" value="${song.trimEnd.toFixed(1)}">
+        </label>
+      </div>
+      <div class="row">
+        <button data-action="preview" data-index="${index}" type="button">Preview trimmed song</button>
+        <button data-action="detect" data-index="${index}" type="button">Detect silence</button>
+        <button data-action="up" data-index="${index}" type="button" ${index===0?"disabled":""}>Move up</button>
+        <button data-action="down" data-index="${index}" type="button" ${index===songs.length-1?"disabled":""}>Move down</button>
+        <button data-action="remove" data-index="${index}" type="button">Remove</button>
+      </div>
+      <audio id="preview-${index}" controls class="hidden"></audio>
+    `;
+    songsEl.appendChild(card);
+  });
+  announce(songs.length ? `${songs.length} song${songs.length===1?"":"s"} ready.` : "No songs added yet.");
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+$("files").addEventListener("change", async (e) => {
+  const files = [...e.target.files];
+  if (!files.length) return;
+  announce(`Reading ${files.length} file${files.length===1?"":"s"}...`);
+  progressEl.classList.remove("hidden");
+  progressEl.max = files.length;
+  progressEl.value = 0;
+  for (const file of files) {
+    try {
+      const meta = await parseWav(file);
+      songs.push({ file, meta, trimStart:0, trimEnd:0, previewUrl:null });
+    } catch (err) {
+      alert(`${file.name}: ${err.message}`);
+    }
+    progressEl.value++;
+  }
+  progressEl.classList.add("hidden");
+  render();
+  e.target.value = "";
+});
+
+songsEl.addEventListener("input", (e) => {
+  const index = Number(e.target.dataset.index);
+  const action = e.target.dataset.action;
+  if (!Number.isInteger(index) || !songs[index]) return;
+  const v = Math.max(0, Number(e.target.value) || 0);
+  if (action === "trimStart") songs[index].trimStart = v;
+  if (action === "trimEnd") songs[index].trimEnd = v;
+});
+
+songsEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  const index = Number(btn.dataset.index);
+  const action = btn.dataset.action;
+  const song = songs[index];
+  if (!song) return;
+
+  if (action === "up" && index > 0) {
+    [songs[index-1], songs[index]] = [songs[index], songs[index-1]];
+    render();
+  } else if (action === "down" && index < songs.length-1) {
+    [songs[index+1], songs[index]] = [songs[index], songs[index+1]];
+    render();
+  } else if (action === "remove") {
+    if (song.previewUrl) URL.revokeObjectURL(song.previewUrl);
+    songs.splice(index,1);
+    render();
+  } else if (action === "preview") {
+    const audio = $(`preview-${index}`);
+    const blob = trimmedBlob(song);
+    if (song.previewUrl) URL.revokeObjectURL(song.previewUrl);
+    song.previewUrl = URL.createObjectURL(blob);
+    audio.src = song.previewUrl;
+    audio.classList.remove("hidden");
+    audio.play().catch(()=>{});
+    announce(`Playing ${song.file.name} from the selected trim point.`);
+  } else if (action === "detect") {
+    btn.disabled = true;
+    try {
+      announce(`Detecting silence in ${song.file.name}...`);
+      const result = await detectSilence(song);
+      song.trimStart = result.start;
+      song.trimEnd = result.end;
+      render();
+      announce(`Detected about ${result.start.toFixed(1)} seconds at the start and ${result.end.toFixed(1)} seconds at the end.`, "success");
+    } catch (err) {
+      announce(`Could not detect silence: ${err.message}`, "danger");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+});
+
+function byteRange(song) {
+  const m = song.meta;
+  const startFrames = Math.floor(Math.min(song.trimStart, m.duration) * m.sampleRate);
+  const endFrames = Math.floor(Math.min(song.trimEnd, m.duration) * m.sampleRate);
+  const totalFrames = Math.floor(m.dataSize / m.blockAlign);
+  const firstFrame = Math.min(startFrames, totalFrames);
+  const lastFrame = Math.max(firstFrame, totalFrames - endFrames);
+  return {
+    start: m.dataOffset + firstFrame * m.blockAlign,
+    end: m.dataOffset + lastFrame * m.blockAlign,
+    bytes: (lastFrame - firstFrame) * m.blockAlign
+  };
+}
+
+function trimmedBlob(song) {
+  const r = byteRange(song);
+  const header = makeWavHeader(song.meta, r.bytes);
+  return new Blob([header, song.file.slice(r.start, r.end)], {type:"audio/wav"});
+}
+
+function sampleAbs(view, offset, format, bits) {
+  if (format === 1) {
+    if (bits === 8) return Math.abs((view.getUint8(offset)-128)/128);
+    if (bits === 16) return Math.abs(view.getInt16(offset,true)/32768);
+    if (bits === 24) {
+      let v = view.getUint8(offset) | (view.getUint8(offset+1)<<8) | (view.getUint8(offset+2)<<16);
+      if (v & 0x800000) v |= 0xff000000;
+      return Math.abs(v/8388608);
+    }
+    if (bits === 32) return Math.abs(view.getInt32(offset,true)/2147483648);
+  }
+  if (format === 3 && bits === 32) return Math.abs(view.getFloat32(offset,true));
+  throw new Error(`Silence detection does not support WAV format ${format}, ${bits}-bit.`);
+}
+
+async function detectSilence(song) {
+  const m = song.meta;
+  const buf = await song.file.slice(m.dataOffset, m.dataOffset + m.dataSize).arrayBuffer();
+  const v = new DataView(buf);
+  const bytesPerSample = m.bitsPerSample / 8;
+  const threshold = 0.012; // about -38 dB
+  const windowFrames = Math.max(1, Math.floor(m.sampleRate * 0.03));
+  const totalFrames = Math.floor(m.dataSize / m.blockAlign);
+
+  function frameActive(frame) {
+    const base = frame * m.blockAlign;
+    let peak = 0;
+    for (let ch=0; ch<m.channels; ch++) {
+      peak = Math.max(peak, sampleAbs(v, base + ch*bytesPerSample, m.audioFormat, m.bitsPerSample));
+    }
+    return peak >= threshold;
+  }
+
+  let first = 0;
+  outerStart:
+  for (let f=0; f<totalFrames; f+=windowFrames) {
+    const stop = Math.min(totalFrames, f+windowFrames);
+    for (let x=f; x<stop; x+=Math.max(1,Math.floor(windowFrames/10))) {
+      if (frameActive(x)) { first = f; break outerStart; }
+    }
+  }
+
+  let last = totalFrames;
+  outerEnd:
+  for (let f=totalFrames-1; f>=0; f-=windowFrames) {
+    const start = Math.max(0, f-windowFrames+1);
+    for (let x=f; x>=start; x-=Math.max(1,Math.floor(windowFrames/10))) {
+      if (frameActive(x)) { last = Math.min(totalFrames, f+1); break outerEnd; }
+    }
+  }
+
+  const safety = 0.12;
+  const startSec = Math.max(0, first/m.sampleRate - safety);
+  const endSec = Math.max(0, (totalFrames-last)/m.sampleRate - safety);
+  return {start:startSec, end:endSec};
+}
+
+function makeWavHeader(meta, dataBytes) {
+  const b = new ArrayBuffer(44);
+  const v = new DataView(b);
+  const write = (o,s) => { for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i)); };
+  write(0,"RIFF");
+  v.setUint32(4, 36 + dataBytes, true);
+  write(8,"WAVE");
+  write(12,"fmt ");
+  v.setUint32(16,16,true);
+  v.setUint16(20,meta.audioFormat,true);
+  v.setUint16(22,meta.channels,true);
+  v.setUint32(24,meta.sampleRate,true);
+  v.setUint32(28,meta.byteRate,true);
+  v.setUint16(32,meta.blockAlign,true);
+  v.setUint16(34,meta.bitsPerSample,true);
+  write(36,"data");
+  v.setUint32(40,dataBytes,true);
+  return b;
+}
+
+$("build").addEventListener("click", async () => {
+  if (!songs.length) { announce("Add at least one WAV song first.", "danger"); return; }
+  const base = songs[0].meta;
+  for (const s of songs) {
+    if (!sameFormat(base,s.meta)) {
+      announce(`The WAV files do not all use the same format. ${s.file.name} differs from the first file.`, "danger");
+      return;
+    }
+    if (s.trimStart + s.trimEnd >= s.meta.duration) {
+      announce(`${s.file.name} is trimmed too much.`, "danger");
+      return;
+    }
+  }
+
+  const gapSeconds = Math.max(0, Number($("gap").value) || 0);
+  const gapFrames = Math.floor(gapSeconds * base.sampleRate);
+  const gapBytes = gapFrames * base.blockAlign;
+  const silentGap = gapBytes ? new Uint8Array(gapBytes) : null;
+
+  let dataBytes = 0;
+  const parts = [];
+  songs.forEach((s,i) => {
+    const r = byteRange(s);
+    dataBytes += r.bytes;
+    parts.push(s.file.slice(r.start,r.end));
+    if (i < songs.length-1 && gapBytes) {
+      dataBytes += gapBytes;
+      parts.push(silentGap);
+    }
+  });
+
+  if (dataBytes > 0xffffffff - 36) {
+    announce("The finished WAV would be larger than the standard WAV limit of about 4 GB.", "danger");
+    return;
+  }
+
+  announce("Building the album...");
+  progressEl.classList.remove("hidden");
+  progressEl.value = 0.5;
+  await new Promise(r => setTimeout(r, 50));
+  const header = makeWavHeader(base, dataBytes);
+  const blob = new Blob([header, ...parts], {type:"audio/wav"});
+  if (outputUrl) URL.revokeObjectURL(outputUrl);
+  outputUrl = URL.createObjectURL(blob);
+  playerEl.src = outputUrl;
+  downloadEl.href = outputUrl;
+  resultEl.classList.remove("hidden");
+  progressEl.value = 1;
+  setTimeout(()=>progressEl.classList.add("hidden"),400);
+  announce(`Album ready. Approximate size: ${(blob.size/1024/1024).toFixed(1)} MB.`, "success");
+  resultEl.scrollIntoView({behavior:"smooth"});
+});
+
+$("clear").addEventListener("click", () => {
+  if (!confirm("Remove all songs from this page? Your original files will not be deleted.")) return;
+  songs.forEach(s => s.previewUrl && URL.revokeObjectURL(s.previewUrl));
+  songs = [];
+  render();
+  resultEl.classList.add("hidden");
+  if (outputUrl) URL.revokeObjectURL(outputUrl);
+  outputUrl = null;
+});
+
+render();
+</script>
+</body>
+</html>
