@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Accessible Audio Album Combiner</title>
+<style>
+  :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  body { margin: 0; padding: 1rem; max-width: 900px; margin-inline: auto; line-height: 1.5; }
+  h1 { font-size: 1.7rem; margin: 0 0 .5rem; }
+  h2 { font-size: 1.25rem; }
+  .panel, .track { border: 1px solid currentColor; border-radius: .8rem; padding: 1rem; margin: 1rem 0; }
+  .track { border-width: 2px; }
+  button, input, select, a.action { font: inherit; min-height: 44px; padding: .6rem .8rem; margin: .25rem .2rem .25rem 0; }
+  button { border-radius: .55rem; border: 1px solid currentColor; }
+  input[type="number"], select, input[type="text"] { width: min(100%, 20rem); box-sizing: border-box; }
+  .row { display: flex; flex-wrap: wrap; gap: .4rem; align-items: end; }
+  .field { display: flex; flex-direction: column; margin: .4rem .8rem .4rem 0; }
+  .status { font-weight: 600; padding: .6rem 0; }
+  .muted { opacity: .8; }
+  progress { width: 100%; height: 1.2rem; }
+  audio { width: 100%; margin-top: .75rem; }
+  a.action { display: inline-block; border: 2px solid currentColor; border-radius: .55rem; text-decoration: none; font-weight: 700; }
+  .danger { font-weight: 700; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Accessible Audio Album Combiner</h1>
+  <p>Choose your songs, put them in order, trim silence, then combine them into one WAV file. Everything stays on your device.</p>
+
+  <section class="panel" aria-labelledby="addHeading">
+    <h2 id="addHeading">1. Add songs</h2>
+    <label for="files"><strong>Select audio files</strong></label><br>
+    <input id="files" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac" multiple>
+    <p class="muted">You can add all songs at once. Their current order can be changed below.</p>
+  </section>
+
+  <section class="panel" aria-labelledby="settingsHeading">
+    <h2 id="settingsHeading">2. Album settings</h2>
+    <div class="row">
+      <label class="field" for="albumName">Finished filename
+        <input id="albumName" type="text" value="My Combined Album">
+      </label>
+      <label class="field" for="gap">Gap between songs, seconds
+        <input id="gap" type="number" min="0" max="10" step="0.1" value="1">
+      </label>
+      <label class="field" for="quality">Export quality
+        <select id="quality">
+          <option value="44100-mono" selected>High quality mono, smaller file</option>
+          <option value="32000-stereo">Balanced stereo</option>
+          <option value="44100-stereo">Highest quality stereo, very large file</option>
+        </select>
+      </label>
+    </div>
+    <p class="muted">For a long album on iPhone, “High quality mono” is safest. Piano and group vocals should still sound clear.</p>
+  </section>
+
+  <section aria-labelledby="tracksHeading">
+    <h2 id="tracksHeading">3. Songs</h2>
+    <div id="tracks"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="combineHeading">
+    <h2 id="combineHeading">4. Combine</h2>
+    <button id="combine" type="button">Combine songs</button>
+    <button id="cancel" type="button" class="hidden">Cancel</button>
+    <div id="status" class="status" role="status" aria-live="polite">No songs added yet.</div>
+    <progress id="progress" max="100" value="0" class="hidden" aria-label="Combining progress"></progress>
+    <audio id="resultAudio" controls class="hidden"></audio>
+    <div id="resultActions" class="hidden">
+      <a id="download" class="action" href="#">Save WAV file</a>
+      <button id="share" type="button" class="hidden">Share or save file</button>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  'use strict';
+
+  const filesInput = document.getElementById('files');
+  const tracksEl = document.getElementById('tracks');
+  const combineBtn = document.getElementById('combine');
+  const cancelBtn = document.getElementById('cancel');
+  const statusEl = document.getElementById('status');
+  const progressEl = document.getElementById('progress');
+  const resultAudio = document.getElementById('resultAudio');
+  const resultActions = document.getElementById('resultActions');
+  const downloadLink = document.getElementById('download');
+  const shareBtn = document.getElementById('share');
+  const albumNameInput = document.getElementById('albumName');
+  const gapInput = document.getElementById('gap');
+  const qualitySelect = document.getElementById('quality');
+
+  let tracks = [];
+  let currentPreview = null;
+  let currentObjectUrl = null;
+  let currentOutputFile = null;
+  let cancelRequested = false;
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+
+  function setStatus(message) {
+    statusEl.textContent = message;
+  }
+
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds)) return 'unknown';
+    const m = Math.floor(seconds / 60);
+    const s = Math.round(seconds % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+  }
+
+  async function decodeFile(file) {
+    const ctx = new AudioCtx();
+    try {
+      const data = await file.arrayBuffer();
+      return await ctx.decodeAudioData(data.slice(0));
+    } finally {
+      await ctx.close().catch(() => {});
+    }
+  }
+
+  async function readDuration(track) {
+    try {
+      const buffer = await decodeFile(track.file);
+      track.duration = buffer.duration;
+    } catch (err) {
+      track.error = 'Could not read this audio file.';
+    }
+  }
+
+  filesInput.addEventListener('change', async () => {
+    const selected = Array.from(filesInput.files || []);
+    if (!selected.length) return;
+    for (const file of selected) {
+      const track = {
+        id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()),
+        file,
+        name: file.name.replace(/\.[^.]+$/, ''),
+        duration: NaN,
+        trimStart: 0,
+        trimEnd: 0,
+        error: ''
+      };
+      tracks.push(track);
+      renderTracks();
+      await readDuration(track);
+      renderTracks();
+    }
+    filesInput.value = '';
+    setStatus(`${tracks.length} song${tracks.length === 1 ? '' : 's'} added.`);
+  });
+
+  function renderTracks() {
+    tracksEl.innerHTML = '';
+    if (!tracks.length) {
+      tracksEl.innerHTML = '<p>No songs added.</p>';
+      return;
+    }
+
+    tracks.forEach((track, index) => {
+      const card = document.createElement('article');
+      card.className = 'track';
+      card.setAttribute('aria-label', `Song ${index + 1}: ${track.name}`);
+
+      const heading = document.createElement('h3');
+      heading.textContent = `${index + 1}. ${track.name}`;
+      card.appendChild(heading);
+
+      const info = document.createElement('p');
+      info.textContent = track.error ? track.error : `Length: ${formatTime(track.duration)}`;
+      if (track.error) info.className = 'danger';
+      card.appendChild(info);
+
+      const row = document.createElement('div');
+      row.className = 'row';
+
+      row.appendChild(makeNumberField(track, 'trimStart', 'Trim from start, seconds'));
+      row.appendChild(makeNumberField(track, 'trimEnd', 'Trim from end, seconds'));
+      card.appendChild(row);
+
+      const controls = document.createElement('div');
+      controls.className = 'row';
+
+      controls.appendChild(makeButton('Play trimmed song', () => previewTrack(track, false)));
+      controls.appendChild(makeButton('Play first 20 seconds', () => previewTrack(track, true)));
+      controls.appendChild(makeButton('Stop', stopPreview));
+      controls.appendChild(makeButton('Detect silence', () => detectSilence(track)));
+      controls.appendChild(makeButton('Move up', () => moveTrack(index, -1), index === 0));
+      controls.appendChild(makeButton('Move down', () => moveTrack(index, 1), index === tracks.length - 1));
+      controls.appendChild(makeButton('Remove', () => removeTrack(index)));
+      card.appendChild(controls);
+
+      tracksEl.appendChild(card);
+    });
+  }
+
+  function makeNumberField(track, key, labelText) {
+    const label = document.createElement('label');
+    label.className = 'field';
+    label.textContent = labelText;
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '0';
+    input.step = '0.1';
+    input.value = track[key];
+    input.addEventListener('change', () => {
+      const value = Math.max(0, Number(input.value) || 0);
+      const maxAllowed = Number.isFinite(track.duration) ? Math.max(0, track.duration - 0.1) : value;
+      track[key] = Math.min(value, maxAllowed);
+      if (track.trimStart + track.trimEnd >= track.duration && Number.isFinite(track.duration)) {
+        track[key] = Math.max(0, track.duration - (key === 'trimStart' ? track.trimEnd : track.trimStart) - 0.1);
+      }
+      input.value = track[key].toFixed(1).replace(/\.0$/, '');
+    });
+    label.appendChild(input);
+    return label;
+  }
+
+  function makeButton(text, handler, disabled = false) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    button.disabled = disabled;
+    button.addEventListener('click', handler);
+    return button;
+  }
+
+  function moveTrack(index, delta) {
+    const newIndex = index + delta;
+    if (newIndex < 0 || newIndex >= tracks.length) return;
+    [tracks[index], tracks[newIndex]] = [tracks[newIndex], tracks[index]];
+    renderTracks();
+    setStatus(`${tracks[newIndex].name} moved to position ${newIndex + 1}.`);
+  }
+
+  function removeTrack(index) {
+    const [removed] = tracks.splice(index, 1);
+    renderTracks();
+    setStatus(`${removed.name} removed.`);
+  }
+
+  function stopPreview() {
+    if (currentPreview) {
+      currentPreview.pause();
+      URL.revokeObjectURL(currentPreview.src);
+      currentPreview = null;
+      setStatus('Preview stopped.');
+    }
+  }
+
+  async function previewTrack(track, firstOnly) {
+    stopPreview();
+    setStatus(`Preparing ${track.name} preview…`);
+    try {
+      const buffer = await decodeFile(track.file);
+      const start = Math.min(track.trimStart, buffer.duration);
+      const end = Math.max(start, buffer.duration - track.trimEnd);
+      const previewEnd = firstOnly ? Math.min(end, start + 20) : end;
+      const sampleRate = buffer.sampleRate;
+      const startFrame = Math.floor(start * sampleRate);
+      const endFrame = Math.floor(previewEnd * sampleRate);
+      const wavBlob = encodeBufferSliceToWav(buffer, startFrame, endFrame, buffer.numberOfChannels > 1 ? 2 : 1, sampleRate);
+      const url = URL.createObjectURL(wavBlob);
+      const audio = new Audio(url);
+      currentPreview = audio;
+      audio.addEventListener('ended', stopPreview, { once: true });
+      await audio.play();
+      setStatus(`Playing ${track.name}.`);
+    } catch (err) {
+      console.error(err);
+      setStatus(`Could not play ${track.name}.`);
+    }
+  }
+
+  async function detectSilence(track) {
+    setStatus(`Detecting silence in ${track.name}…`);
+    try {
+      const buffer = await decodeFile(track.file);
+      const rate = buffer.sampleRate;
+      const threshold = 0.008; // about -42 dB
+      const block = Math.max(1, Math.floor(rate * 0.02));
+      let first = 0;
+      let last = buffer.length - 1;
+
+      outerStart:
+      for (let i = 0; i < buffer.length; i += block) {
+        for (let c = 0; c < buffer.numberOfChannels; c++) {
+          const data = buffer.getChannelData(c);
+          const to = Math.min(buffer.length, i + block);
+          for (let j = i; j < to; j++) {
+            if (Math.abs(data[j]) >= threshold) {
+              first = Math.max(0, i - Math.floor(rate * 0.15));
+              break outerStart;
+            }
+          }
+        }
+      }
+
+      outerEnd:
+      for (let i = buffer.length - 1; i >= 0; i -= block) {
+        for (let c = 0; c < buffer.numberOfChannels; c++) {
+          const data = buffer.getChannelData(c);
+          const from = Math.max(0, i - block);
+          for (let j = i; j >= from; j--) {
+            if (Math.abs(data[j]) >= threshold) {
+              last = Math.min(buffer.length - 1, i + Math.floor(rate * 0.15));
+              break outerEnd;
+            }
+          }
+        }
+      }
+
+      track.trimStart = Math.max(0, first / rate);
+      track.trimEnd = Math.max(0, buffer.duration - (last / rate));
+      renderTracks();
+      setStatus(`Suggested trim for ${track.name}: ${track.trimStart.toFixed(1)} seconds from the start and ${track.trimEnd.toFixed(1)} seconds from the end.`);
+    } catch (err) {
+      console.error(err);
+      setStatus(`Could not detect silence in ${track.name}.`);
+    }
+  }
+
+  function parseQuality() {
+    const [rateText, channelsText] = qualitySelect.value.split('-');
+    return {
+      sampleRate: Number(rateText),
+      channels: channelsText === 'stereo' ? 2 : 1
+    };
+  }
+
+  combineBtn.addEventListener('click', combineSongs);
+  cancelBtn.addEventListener('click', () => {
+    cancelRequested = true;
+    setStatus('Cancelling after the current song…');
+  });
+
+  async function combineSongs() {
+    if (!tracks.length) {
+      setStatus('Add at least one song first.');
+      return;
+    }
+    stopPreview();
+    cancelRequested = false;
+    combineBtn.disabled = true;
+    cancelBtn.classList.remove('hidden');
+    progressEl.classList.remove('hidden');
+    progressEl.value = 0;
+    resultAudio.classList.add('hidden');
+    resultActions.classList.add('hidden');
+
+    try {
+      const { sampleRate, channels } = parseQuality();
+      const gapSeconds = Math.max(0, Math.min(10, Number(gapInput.value) || 0));
+      const gapFrames = Math.floor(gapSeconds * sampleRate);
+      const parts = [];
+      let totalFrames = 0;
+
+      for (let i = 0; i < tracks.length; i++) {
+        if (cancelRequested) throw new Error('cancelled');
+        const track = tracks[i];
+        setStatus(`Processing song ${i + 1} of ${tracks.length}: ${track.name}`);
+        const buffer = await decodeFile(track.file);
+        const startSec = Math.min(track.trimStart, buffer.duration);
+        const endSec = Math.max(startSec, buffer.duration - track.trimEnd);
+        const pcm = resampleToPcm16(buffer, startSec, endSec, sampleRate, channels);
+        parts.push(pcm.bytes);
+        totalFrames += pcm.frames;
+
+        if (i < tracks.length - 1 && gapFrames > 0) {
+          const silence = new Uint8Array(gapFrames * channels * 2);
+          parts.push(silence);
+          totalFrames += gapFrames;
+        }
+        progressEl.value = Math.round(((i + 1) / tracks.length) * 90);
+        await new Promise(requestAnimationFrame);
+      }
+
+      if (cancelRequested) throw new Error('cancelled');
+      setStatus('Building the final WAV file…');
+      const dataBytes = totalFrames * channels * 2;
+      const header = makeWavHeader(dataBytes, sampleRate, channels, 16);
+      const blob = new Blob([header, ...parts], { type: 'audio/wav' });
+      const safeName = (albumNameInput.value.trim() || 'Combined Album').replace(/[\\/:*?"<>|]+/g, '-');
+      const filename = `${safeName}.wav`;
+
+      if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+      currentObjectUrl = URL.createObjectURL(blob);
+      currentOutputFile = new File([blob], filename, { type: 'audio/wav' });
+      resultAudio.src = currentObjectUrl;
+      resultAudio.classList.remove('hidden');
+      downloadLink.href = currentObjectUrl;
+      downloadLink.download = filename;
+      downloadLink.textContent = `Save ${filename}`;
+      resultActions.classList.remove('hidden');
+
+      if (navigator.canShare && navigator.canShare({ files: [currentOutputFile] })) {
+        shareBtn.classList.remove('hidden');
+      } else {
+        shareBtn.classList.add('hidden');
+      }
+      progressEl.value = 100;
+      const mb = (blob.size / (1024 * 1024)).toFixed(1);
+      setStatus(`Finished. The combined album is ${mb} MB. Preview it, then use Save or Share.`);
+    } catch (err) {
+      if (err && err.message === 'cancelled') {
+        setStatus('Combining cancelled.');
+      } else {
+        console.error(err);
+        setStatus('Something went wrong while combining. Try the mono quality option or fewer songs at once.');
+      }
+    } finally {
+      combineBtn.disabled = false;
+      cancelBtn.classList.add('hidden');
+      progressEl.classList.add('hidden');
+    }
+  }
+
+  shareBtn.addEventListener('click', async () => {
+    if (!currentOutputFile) return;
+    try {
+      await navigator.share({ files: [currentOutputFile], title: currentOutputFile.name });
+    } catch (err) {
+      if (err && err.name !== 'AbortError') setStatus('Sharing did not work. Use the Save link instead.');
+    }
+  });
+
+  function resampleToPcm16(buffer, startSec, endSec, targetRate, targetChannels) {
+    const sourceRate = buffer.sampleRate;
+    const sourceStart = Math.floor(startSec * sourceRate);
+    const sourceEnd = Math.min(buffer.length, Math.floor(endSec * sourceRate));
+    const sourceFrames = Math.max(0, sourceEnd - sourceStart);
+    const targetFrames = Math.max(0, Math.floor(sourceFrames * targetRate / sourceRate));
+    const out = new Int16Array(targetFrames * targetChannels);
+    const sourceChannels = buffer.numberOfChannels;
+
+    for (let i = 0; i < targetFrames; i++) {
+      const sourcePos = sourceStart + (i * sourceRate / targetRate);
+      const idx = Math.floor(sourcePos);
+      const frac = sourcePos - idx;
+      const idx2 = Math.min(sourceEnd - 1, idx + 1);
+
+      let left = 0, right = 0;
+      if (sourceChannels === 1) {
+        const d = buffer.getChannelData(0);
+        left = right = d[idx] * (1 - frac) + d[idx2] * frac;
+      } else {
+        const dl = buffer.getChannelData(0);
+        const dr = buffer.getChannelData(1);
+        left = dl[idx] * (1 - frac) + dl[idx2] * frac;
+        right = dr[idx] * (1 - frac) + dr[idx2] * frac;
+      }
+
+      if (targetChannels === 1) {
+        out[i] = floatToInt16((left + right) * 0.5);
+      } else {
+        out[i * 2] = floatToInt16(left);
+        out[i * 2 + 1] = floatToInt16(right);
+      }
+    }
+    return { bytes: new Uint8Array(out.buffer), frames: targetFrames };
+  }
+
+  function floatToInt16(value) {
+    const v = Math.max(-1, Math.min(1, value));
+    return v < 0 ? Math.round(v * 32768) : Math.round(v * 32767);
+  }
+
+  function makeWavHeader(dataBytes, sampleRate, channels, bitsPerSample) {
+    const buffer = new ArrayBuffer(44);
+    const view = new DataView(buffer);
+    const write = (offset, text) => {
+      for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    const blockAlign = channels * bitsPerSample / 8;
+    const byteRate = sampleRate * blockAlign;
+    write(0, 'RIFF');
+    view.setUint32(4, 36 + dataBytes, true);
+    write(8, 'WAVE');
+    write(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, channels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitsPerSample, true);
+    write(36, 'data');
+    view.setUint32(40, dataBytes, true);
+    return new Uint8Array(buffer);
+  }
+
+  function encodeBufferSliceToWav(buffer, startFrame, endFrame, channels, sampleRate) {
+    const frames = Math.max(0, endFrame - startFrame);
+    const out = new Int16Array(frames * channels);
+    for (let i = 0; i < frames; i++) {
+      if (channels === 1) {
+        let sum = 0;
+        for (let c = 0; c < buffer.numberOfChannels; c++) sum += buffer.getChannelData(c)[startFrame + i] || 0;
+        out[i] = floatToInt16(sum / buffer.numberOfChannels);
+      } else {
+        const left = buffer.getChannelData(0)[startFrame + i] || 0;
+        const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1)[startFrame + i] || 0 : left;
+        out[i * 2] = floatToInt16(left);
+        out[i * 2 + 1] = floatToInt16(right);
+      }
+    }
+    const header = makeWavHeader(out.byteLength, sampleRate, channels, 16);
+    return new Blob([header, new Uint8Array(out.buffer)], { type: 'audio/wav' });
+  }
+})();
+</script>
+</body>
+</html>
